@@ -59,6 +59,7 @@ pred = pd.DataFrame([*zip(vocab, model.coef_[0])], columns=["word", "weight"]).s
 html = pred.head(10).to_html(index=False) + pred.tail(10).to_html(index=False)
 display_html(html.replace('table','table style="display:inline"'), raw=True)
 
+'''
 Cross Validation Accuracy: 98% - Predictors:
 WORD      WEIGHT
 wrote     -0.974206
@@ -83,6 +84,7 @@ bodi      0.531293
 click     0.696832
 our       0.764773
 wi        0.900796
+'''
 
 # PCA Dimensionality Reduction
 def reduce_dim(feat, k):    
