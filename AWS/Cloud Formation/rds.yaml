@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: RDS deployment.
+Parameters:
+  VPCCidrBlock:
+    Type: String
+  EnvironmentName:
+    Type: String
+  RDSAdminPassword:
+    NoEcho: true
+    Type: String
+  PostgresPassword:
+    NoEcho: true
+    Type: String
+  DBInstanceClass:
+    Type: String
+  DBName:
+    Type: String
+  CFNBucketName:
+    Type: String
+Resources:
+# IAM Roles
+  RDSMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - monitoring.rds.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      RoleName: !Sub '${EnvironmentName}-rds-monitoring'
+  RDSQueryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      RoleName: !Sub '${EnvironmentName}-rds-query'
+# Layers
+  Psycopg2Layer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes: [python3.7]
+      Content:
+        S3Bucket: !Ref CFNBucketName
+        S3Key: psycopg2.zip
+      Description: Psycopg2 module for Lambda to connect with RDS server (postgres).
+      LayerName: !Sub '${EnvironmentName}-psycopg2'
+# Lambdas
+  RDSQueryLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+            import psycopg2
+            import cfnresponse
+            
+            def lambda_handler(event, context):
+              try:
+                with psycopg2.connect(f'''
+                  dbname   = {event['ResourceProperties']['DBName']}
+                  user     = {event['ResourceProperties']['DBUser']}
+                  password = {event['ResourceProperties']['DBPassword']}
+                  host     = {event['ResourceProperties']['DBHost']}
+                  port     = {event['ResourceProperties']['DBPort']}''') as conn:
+                  with conn.cursor() as cur:
+                    if   event['RequestType'] == 'Create':
+                      cur.execute(f'''{event['ResourceProperties']['DBCreateQuery']}''')
+                    elif event['RequestType'] == 'Delete':
+                      cur.execute(f'''{event['ResourceProperties']['DBDeleteQuery']}''')
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Data': 'Operation completed successfully'}, "None")
+              except Exception as e:
+                cfnresponse.send(event, context, cfnresponse.FAILED,  {'Data': str(e)}, "None")
+      FunctionName: !Sub '${EnvironmentName}-rds-query'
+      Handler: index.lambda_handler
+      Layers: [!Ref Psycopg2Layer]
+      Role: !GetAtt RDSQueryRole.Arn
+      Runtime: python3.7
+      Timeout: 30
+      VpcConfig:
+        SecurityGroupIds: [!ImportValue LambdaSecurityGroup]
+        SubnetIds: [!ImportValue LambdaSubnet]
+# Security Groups
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: RDSSecurityGroup
+      GroupDescription: Allow postgres traffic from private subnet.
+      VpcId: !ImportValue VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !Sub
+            - '${FirstOctet}.${SecondOctet}.1.0/24'
+            - FirstOctet:  !Select [0, !Split ['.', !Ref VPCCidrBlock]]
+              SecondOctet: !Select [1, !Split ['.', !Ref VPCCidrBlock]]
+          Description: lambda
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !Sub
+            - '${FirstOctet}.${SecondOctet}.2.0/24'
+            - FirstOctet:  !Select [0, !Split ['.', !Ref VPCCidrBlock]]
+              SecondOctet: !Select [1, !Split ['.', !Ref VPCCidrBlock]]
+          Description: admin
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-rds'
+# RDS Configuration
+  RDSSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Available subnets for RDS instance.
+      DBSubnetGroupName: !Sub '${EnvironmentName}-subnet-group'
+      SubnetIds:
+        - !ImportValue LambdaSubnet
+        - !ImportValue RDSSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-subnet-group'
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AllocatedStorage: 150
+      AvailabilityZone: !Select [0, !GetAZs {Ref: 'AWS::Region'}] # 1a
+      BackupRetentionPeriod: 7
+      CopyTagsToSnapshot: true
+      DBInstanceClass: !Ref DBInstanceClass
+      DBInstanceIdentifier: !Sub '${EnvironmentName}-rds'
+      DBName: !Ref DBName
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      DeleteAutomatedBackups: false
+      DeletionProtection: false
+      EnableCloudwatchLogsExports: [postgresql, upgrade]
+      Engine: postgres
+      EngineVersion: 10.6
+      MasterUsername: dbadmin
+      MasterUserPassword: !Ref RDSAdminPassword
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt RDSMonitoringRole.Arn
+      MultiAZ: No
+      PubliclyAccessible: false
+      StorageEncrypted: true
+      StorageType: gp2
+      VPCSecurityGroups: [!Ref RDSSecurityGroup]
+# Custom Resources
+  CreateAdminUser:
+    Type: Custom::CreateAdminUser
+    Properties:
+      ServiceToken: !GetAtt RDSQueryLambda.Arn
+      DBName: !Ref DBName
+      DBHost: !GetAtt RDSInstance.Endpoint.Address
+      DBPort: 5432
+      DBUser: dbadmin
+      DBPassword: !Ref RDSAdminPassword
+      DBCreateQuery: !Sub |
+        CREATE ROLE postgres WITH
+          LOGIN
+          NOSUPERUSER
+          INHERIT
+          CREATEDB
+          CREATEROLE
+          NOREPLICATION
+          ENCRYPTED PASSWORD '${PostgresPassword}';
+      DBDeleteQuery:
+        DO $$ BEGIN
+          IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='postgres') THEN
+            DROP USER postgres;
+          END IF;
+        END $$;
+Outputs:
+  RDSDatabaseName:
+    Value: !Ref DBName
+    Export:
+      Name: RDSDatabaseName
+  RDSEndpointAddress:
+    Value: !GetAtt RDSInstance.Endpoint.Address
+    Export:
+      Name: RDSEndpointAddress
+  RDSQueryLambdaArn:
+    Value: !GetAtt RDSQueryLambda.Arn
+    Export:
+      Name: RDSQueryLambdaArn
+  RDSPsycopg2Layer:
+    Value: !Ref Psycopg2Layer
+    Export:
+      Name: RDSPsycopg2Layer
