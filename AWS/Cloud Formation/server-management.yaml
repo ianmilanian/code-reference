@@ -1,0 +1,266 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: EC2 server management lambda functions.
+Parameters:
+  VPCCidrBlock:
+    Type: String
+  EnvironmentName:
+    Type: String
+  DMZSourceIp:
+    Type: String
+Resources:
+# IAM Roles
+  ServerManagementRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${EnvironmentName}-server-management'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ec2:DescribeInstances
+                  - events:EnableRule
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                  - events:DisableRule
+                Resource: '*'
+      Path: /
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      RoleName: !Sub '${EnvironmentName}-server-management'
+  ServerSnapshotRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${EnvironmentName}-server-snapshot'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DeleteSnapshot
+                  - ec2:DescribeTags
+                  - ec2:CreateTags
+                  - ec2:DescribeRegions
+                  - ec2:DescribeVolumes
+                  - ec2:CreateSnapshot
+                  - ec2:DescribeSnapshots
+                Resource: '*'
+      Path: /
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      RoleName: !Sub '${EnvironmentName}-server-snapshot'
+# Lambdas
+  ServerShutdownLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import os
+          import time
+          import boto3
+          
+          def get_id(instance):
+              return instance['Instances'][0]['InstanceId']
+              
+          def send_warning_all(instances, minutes):
+              ''' Message running Windows EC2's with SSM role attached. '''
+              message  = f'"Shutting Down EC2 in {minutes} Minutes."'
+              commands = [f'msg * {message}']
+              for instance in instances:
+                  try: # windows / running / ssm_role
+                      boto3.client('ssm').send_command(
+                          InstanceIds  = [get_id(instance)],
+                          DocumentName = 'AWS-RunPowerShellScript',
+                          Parameters   = {'commands': commands})
+                  except:
+                      pass
+              time.sleep(60*minutes)
+              
+          def lambda_handler(event, context):
+              monitored = {'Name': 'tag:Shutdown', 'Values': ['No']}
+              kwargs    = {'region_name': os.environ['AWS_REGION']}
+              client    = boto3.client('ec2', **kwargs)
+              ignore    = [get_id(instance) for instance in client.describe_instances(Filters=[monitored]).get('Reservations', [])]
+              instances = [instance for instance in client.describe_instances().get('Reservations', []) if get_id(instance) not in ignore]
+              send_warning_all(instances, 5)
+              return client.stop_instances(InstanceIds=[get_id(instance) for instance in instances])
+      FunctionName: !Sub '${EnvironmentName}-server-shutdown'
+      Handler: index.lambda_handler
+      Role: !GetAtt ServerManagementRole.Arn
+      Runtime: python3.7
+      Timeout: 600
+      VpcConfig:
+        SecurityGroupIds: [!ImportValue LambdaSecurityGroup]
+        SubnetIds: [!ImportValue LambdaSubnet]
+  ServerStartupLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          
+          def lambda_handler(event, context):
+              def get_id(instance):
+                  return instance['Instances'][0]['InstanceId']
+              
+              monitored = {'Name': 'tag:Startup', 'Values': ['Yes']}
+              kwargs    = {'region_name': os.environ['AWS_REGION']}
+              client    = boto3.client('ec2', **kwargs)
+              instances = client.describe_instances(Filters=[monitored]).get('Reservations', [])
+              return client.start_instances(InstanceIds=[get_id(instance) for instance in instances])
+      FunctionName: !Sub '${EnvironmentName}-server-startup'
+      Handler: index.lambda_handler
+      Role: !GetAtt ServerManagementRole.Arn
+      Runtime: python3.7
+      Timeout: 30
+      VpcConfig:
+        SecurityGroupIds: [!ImportValue LambdaSecurityGroup]
+        SubnetIds: [!ImportValue LambdaSubnet]
+  ServerSnapshotLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          
+          from datetime import datetime
+          from datetime import timedelta
+          
+          def lambda_handler(event, context):
+              def json_serialize(obj):
+                  if isinstance(obj, (datetime)):
+                      return obj.isoformat()
+              def is_stale(snapshot, retention):
+                  return datetime.now() - snapshot['StartTime'].replace(tzinfo=None) > timedelta(days=retention)
+              def snapshot_name(client, volume):
+                  instance_id   = volume['Attachments'][0]['InstanceId']
+                  instance_desc = client.describe_instances(InstanceIds=[instance_id])
+                  instance_dict = instance_desc['Reservations'][0]['Instances'][0]
+                  for item in instance_dict.get('Tags', []):
+                      if 'Key' in item and item['Key'] == 'Name':
+                          instance_id = item['Value']; break
+                  return '{}-{}-snapshot'.format(instance_id, volume['VolumeId'])
+              
+              responses = []
+              retention = int(os.environ['retention'])
+              is_backup = {'Name': 'tag:Backup', 'Values': ['Yes']}
+              is_volume = {'Name': 'status',     'Values': ['in-use']}
+              tag_specs = [{'ResourceType': 'snapshot', 'Tags': [{'Key':'Backup', 'Value':'Yes'}]}]
+              
+              kwargs = {'region_name': os.environ['AWS_REGION']}
+              client = boto3.client('ec2', **kwargs)
+              for volume in client.describe_volumes(Filters=[is_volume, is_backup]).get('Volumes', []):
+                  responses.append(client.create_snapshot(
+                      Description       = snapshot_name(client, volume),
+                      VolumeId          = volume['VolumeId'],
+                      TagSpecifications = tag_specs))
+                  is_snapshot = {'Name': 'volume-id', 'Values': [volume['VolumeId']]}
+                  for snapshot in client.describe_snapshots(Filters=[is_snapshot, is_backup]).get('Snapshots', []):
+                      if is_stale(snapshot, retention):
+                          responses.append(boto3.resource('ec2', **kwargs).Snapshot(snapshot['SnapshotId']).delete())
+              return json.loads(json.dumps(responses, default=json_serialize))
+      Environment:
+        Variables:
+          retention: 7
+      FunctionName: !Sub '${EnvironmentName}-server-snapshot'
+      Handler: index.lambda_handler
+      Role: !GetAtt ServerSnapshotRole.Arn
+      Runtime: python3.7
+      Timeout: 300
+      VpcConfig:
+        SecurityGroupIds: [!ImportValue LambdaSecurityGroup]
+        SubnetIds: [!ImportValue LambdaSubnet]
+# Lambda Event Rules
+  ServerShutdownEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${EnvironmentName}-server-shutdown'
+      Description: Rule to shutdown managed servers at 20:00 EST.
+      ScheduleExpression: cron(0 0 * * ? *)
+      Targets:
+        - Id: ServerShutdownEventTarget
+          Arn: !GetAtt ServerShutdownLambda.Arn
+      State: ENABLED
+  ServerStartupEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${EnvironmentName}-server-startup'
+      Description: Rule to startup managed servers M-F at 04:00 EST.
+      ScheduleExpression: cron(0 8 ? * MON-FRI *)
+      Targets:
+        - Id: ServerStartupEventTarget
+          Arn: !GetAtt ServerStartupLambda.Arn
+      State: ENABLED
+  ServerSnapshotEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${EnvironmentName}-server-snapshot'
+      Description: Rule to manage volume snapshots every day at midnight EST.
+      ScheduleExpression: cron(0 4 * * ? *)
+      Targets:
+        - Id: ServerSnapshotEventTarget
+          Arn: !GetAtt ServerSnapshotLambda.Arn
+      State: ENABLED
+# Lambda Invoke Permissions
+  ServerShutdownLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ServerShutdownLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ServerShutdownEvent.Arn
+  ServerStartupLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ServerStartupLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ServerStartupEvent.Arn
+  ServerSnapshotLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ServerSnapshotLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ServerSnapshotEvent.Arn
+# Log Groups
+  ServerShutdownLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+      LogGroupName: !Sub '/aws/lambda/${ServerShutdownLambda}'
+  ServerStartupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+      LogGroupName: !Sub '/aws/lambda/${ServerStartupLambda}'
+  ServerSnapshotLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+      LogGroupName: !Sub '/aws/lambda/${ServerSnapshotLambda}'
