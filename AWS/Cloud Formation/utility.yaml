@@ -1,0 +1,215 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Staging deployment.
+Parameters:
+  EnvironmentName:
+    Type: String
+  WindowsAMI:
+    Type: String
+  AdminKey:
+    Type: AWS::EC2::KeyPair::KeyName
+  RDSAdminPassword:
+    NoEcho: true
+    Type: String
+  UtilityPassword:
+    NoEcho: true
+    Type: String
+  CFNBucketName:
+    Type: String
+  StagingBucketName:
+    Type: String
+Resources:
+# S3 Bucket
+  StagingBucket:
+    DependsOn: StagingLambdaInvokePermission
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: Staging
+            Function: !GetAtt StagingLambda.Arn
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketName: !Ref StagingBucketName
+# IAM Roles
+  UtilityRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${EnvironmentName}-utility'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${CFNBucketName}/utility.zip'
+      ManagedPolicyArns:
+        - !ImportValue SSMManagedPolicy
+      RoleName: !Sub '${EnvironmentName}-utility'
+  StagingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${EnvironmentName}-staging'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${StagingBucketName}/Staging/*'
+      Path: /
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      RoleName: !Sub '${EnvironmentName}-staging'
+# Instance Profiles
+  UtilityInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: [!Ref UtilityRole]
+# Lambdas
+  StagingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import zipfile
+          import urllib.parse
+          
+          from io import BytesIO
+          
+          def resolve_key(key):
+              ''' handles non-ascii characters in key name '''
+              return urllib.parse.quote(key.encode('utf8'))
+              
+          def get_buffer(event):
+              bucket_event  = event['Records'][0]['s3']
+              bucket_name   = bucket_event['bucket']['name']
+              bucket_key    = resolve_key(bucket_event['object']['key'])
+              bucket_object = boto3.resource('s3').Object(bucket_name, bucket_key)
+              return BytesIO(bucket_object.get()['Body'].read())
+              
+          def lambda_handler(event, context):
+              with zipfile.ZipFile(get_buffer(event)) as z: # HD 500MB limit!
+                  try:
+                      data = json.loads(z.read('data.json'))
+                      # do things with data
+                  except KeyError:
+                      print('Failed to load JSON.')
+              return { 'statusCode': 200 }
+      FunctionName: !Sub '${EnvironmentName}-staging'
+      Handler: index.lambda_handler
+      Role: !GetAtt StagingRole.Arn
+      Runtime: python3.7
+      Timeout: 20
+      VpcConfig:
+        SecurityGroupIds: [!ImportValue LambdaSecurityGroup]
+        SubnetIds: [!ImportValue LambdaSubnet]
+# Lambda Invoke Permissions
+  StagingLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StagingLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Sub 'arn:${AWS::Partition}:s3:::${StagingBucketName}'
+# Log Groups
+  StagingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+      LogGroupName: !Sub '/aws/lambda/${StagingLambda}'
+# Servers
+  UtilityServer:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Authentication:
+        S3AccessCreds:
+          type: S3
+          roleName: !Ref UtilityRole
+      AWS::CloudFormation::Init:
+        configSets:
+          Install:
+            - Download
+        Download:
+          files:
+            c:\cfn\cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackName}
+                region=${AWS::Region}
+            c:\cfn\hooks.d\cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.UtilityServer.Metadata.AWS::CloudFormation::Init
+                action=cfn-init.exe -v -c Install -s ${AWS::StackId} -r UtilityServer --region ${AWS::Region}
+            c:\Utility\utility.zip:
+              source: !Sub 'https://${CFNBucketName}.s3-${AWS::Region}.amazonaws.com/utility.zip'
+              authentication: S3AccessCreds
+            c:\Utility\creds:
+              content: !Sub
+                - |
+                  {
+                    "region_name": "${AWS::Region}",
+                    "db_conn": "dbname=${RDSDatabaseNameImport} user=utility_role password=${UtilityPassword} host=${RDSEndpointAddressImport} port=5432",
+                    "schema": "utility"
+                  }
+                - RDSDatabaseNameImport: !ImportValue RDSDatabaseName
+                  RDSEndpointAddressImport: !ImportValue RDSEndpointAddress
+    Properties:
+      AvailabilityZone: !Select [1, !GetAZs {Ref: 'AWS::Region'}] # 1b
+      ImageId: !Ref WindowsAMI # Microsoft Windows Server 2019
+      InstanceType: t3.small
+      KeyName: !Ref AdminKey
+      SecurityGroupIds: [!ImportValue AdminSecurityGroup]
+      SubnetId: !ImportValue AdminSubnet
+      IamInstanceProfile: !Ref UtilityInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 50
+            Encrypted: true
+      UserData:
+        Fn::Base64: !Sub |
+          <script>
+          cfn-init.exe -v -c Install -s ${AWS::StackId} -r UtilityServer --region ${AWS::Region}
+          </script>
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-utility'
