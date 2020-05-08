@@ -1,0 +1,145 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Master deployment.
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: VPC Configuration
+        Parameters:
+          - VPCCidrBlock
+          - EnvironmentName
+          - DMZSourceIp
+      - Label:
+          default: RDS Configuration
+        Parameters:
+          - DBName
+          - DBInstanceClass
+          - RDSAdminPassword
+          - PostgresPassword
+          - UtilityPassword
+      - Label:
+          default: EC2 Configuration
+        Parameters:
+          - LinuxAMI
+          - WindowsAMI
+          - AdminKey
+      - Label:
+          default: S3 Configuration
+        Parameters:
+          - CFNBucketName
+    ParameterLabels:
+      VPCCidrBlock:
+        default: VPC Cidr Block
+      EnvironmentName:
+        default: Environment Name
+      DMZSourceIp:
+        default: DMZ Source Ip
+      DBName:
+        default: Database Name
+      DBInstanceClass:
+        default: Database Instance Class
+      RDSAdminPassword:
+        default: RDS Admin Password
+      PostgresPassword:
+        default: Postgres User Password
+      UtilityPassword:
+        default: Utility Role Password
+      LinuxAMI:
+        default: Linux AMI
+      WindowsAMI:
+        default: Windows AMI
+      AdminKey:
+        default: Admin Key Name
+      CFNBucketName:
+        default: Cloudformation Bucket
+Parameters:
+  VPCCidrBlock:
+    Description: The cidr block (x.x.x.x/16) of the vpc.
+    Type: String
+  EnvironmentName:
+    Description: The environment name to prepend to AWS resources.
+    Type: String
+  DMZSourceIp:
+    Description: The source address (x.x.x.x/32) to allow rdp traffic into DMZ.
+    Type: String
+  DBName:
+    Description: Name of the database to create when the DB instance is created.
+    Type: String
+  DBInstanceClass:
+    Description: Instance class of the RDS server.
+    Type: String
+  RDSAdminPassword:
+    NoEcho: true
+    Type: String
+    Description: RDS administrator password.
+    MinLength: 8
+    MaxLength: 41
+  PostgresPassword:
+    NoEcho: true
+    Type: String
+    Description: Sets the postgres user password.
+    MinLength: 8
+    MaxLength: 41
+  UtilityPassword:
+    NoEcho: true
+    Type: String
+    Description: Utility role password.
+    MinLength: 8
+    MaxLength: 41
+  LinuxAMI:
+    Description: The ami of the VPN server only ubuntu 18.04 supported.
+    Type: String
+  WindowsAMI:
+    Description: The ami of windows servers (Windows 2019 R2).
+    Type: String
+  AdminKey:
+    Description: The EC2 key pair to associate with admin servers.
+    Type: AWS::EC2::KeyPair::KeyName
+  CFNBucketName:
+    Description: The cloudformation bucket name containing deployment scripts.
+    Type: String
+Resources:
+  VPC:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${CFNBucketName}.s3-${AWS::Region}.amazonaws.com/vpc.yaml'
+      Parameters:
+        VPCCidrBlock:       !Ref VPCCidrBlock
+        EnvironmentName:    !Ref EnvironmentName
+        DMZSourceIp:        !Ref DMZSourceIp
+        LinuxAMI:           !Ref LinuxAMI
+        AdminKey:           !Ref AdminKey
+  ServerManagement:
+    DependsOn: VPC
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${CFNBucketName}.s3-${AWS::Region}.amazonaws.com/server-management.yaml'
+      Parameters:
+        VPCCidrBlock:       !Ref VPCCidrBlock
+        EnvironmentName:    !Ref EnvironmentName
+        DMZSourceIp:        !Ref DMZSourceIp
+  RDS:
+    DependsOn: VPC
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${CFNBucketName}.s3-${AWS::Region}.amazonaws.com/rds.yaml'
+      Parameters:
+        VPCCidrBlock:       !Ref VPCCidrBlock
+        EnvironmentName:    !Ref EnvironmentName
+        RDSAdminPassword:   !Ref RDSAdminPassword
+        PostgresPassword:   !Ref PostgresPassword
+        DBInstanceClass:    !Ref DBInstanceClass
+        DBName:             !Ref DBName
+        CFNBucketName:      !Ref CFNBucketName
+  UtilityManagement:
+    DependsOn: RDS
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${CFNBucketName}.s3-${AWS::Region}.amazonaws.com/utility.yaml'
+      Parameters:
+        EnvironmentName:    !Ref EnvironmentName
+        WindowsAMI:         !Ref WindowsAMI
+        AdminKey:           !Ref AdminKey
+        RDSAdminPassword:   !Ref RDSAdminPassword
+        UtilityPassword:    !Ref UtilityPassword
+        CFNBucketName:      !Ref CFNBucketName
