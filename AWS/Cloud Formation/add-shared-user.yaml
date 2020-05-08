@@ -1,0 +1,43 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Create a temporary user with access to a shared bucket.
+Parameters:
+  SharedBucketName:
+    Description: The shared bucket name.
+    Type: String
+  SharedBucketUserName:
+    Description: The shared bucket user name.
+    Type: String
+  TemporaryPassword:
+    NoEcho: true
+    Description: Temporary password for user.
+    Type: String
+Resources:
+  # IAM User
+  SharedBucketUser:
+    Type: AWS::IAM::User
+    Properties:
+      Policies:
+        - PolicyName: !Sub 'shared-bucket-policy'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${SharedBucketName}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${SharedBucketName}/*'
+      UserName: !Ref SharedBucketUserName
+      LoginProfile:
+        Password: !Ref TemporaryPassword
+        PasswordResetRequired: true
+Outputs:
+  S3BucketURL:
+    Value: !Sub 'https://console.amazonaws.com/s3/buckets/${SharedBucketName}'
+  AccountdId:
+    Value: !Ref 'AWS::AccountId'
+  UserName:
+    Value: !Ref SharedBucketUserName
