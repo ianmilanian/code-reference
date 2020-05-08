@@ -1,0 +1,208 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: RPC deployment.
+Parameters:
+  EnvironmentName:
+    Type: String
+  WindowsAMI:
+    Type: String
+  AdminKey:
+    Type: AWS::EC2::KeyPair::KeyName
+  CFNBucketName:
+    Type: String
+  SharedAccessKey:
+    Type: String
+  SharedSecretAccessKey:
+    Type: String
+  SharedRegion:
+    Type: String
+Resources:
+# IAM Roles
+  RPCRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${EnvironmentName}-rpc'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                Resource: '*'
+      Path: /
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      RoleName: !Sub '${EnvironmentName}-rpc'
+  RPCServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${EnvironmentName}-rpc-server'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:DescribeAssociation
+                  - ssm:DescribeDocument
+                  - ssm:GetDocument
+                  - ssm:GetParameters
+                  - ssm:UpdateAssociationStatus
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/access_key'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/secret_key'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/region_name'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/AWS-RunPowerShellScript'
+      ManagedPolicyArns:
+        - !ImportValue SSMManagedPolicy
+      RoleName: !Sub '${EnvironmentName}-rpc-server'
+  ParameterStoreRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${EnvironmentName}-parameter-store'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:DeleteParameter
+                  - kms:Encrypt
+                Resource: '*'
+      Path: /
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      RoleName: !Sub '${EnvironmentName}-parameter-store'
+# Instance Profiles
+  RPCServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: [!Ref RPCServerRole]
+# Lambdas
+  RPCLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          
+          def lambda_handler(event, context):
+              commands = [ # order matters here - modifying env values will change the ec2 session info used to connect to aws services!
+                  '$env:AWS_ACCESS_KEY_ID=(Get-SSMParameterValue -Names access_key -WithDecryption $True).Parameters[0].Value',
+                  '$env:AWS_DEFAULT_REGION=(Get-SSMParameterValue -Names region_name -WithDecryption $True).Parameters[0].Value',
+                  '$env:AWS_SECRET_ACCESS_KEY=(Get-SSMParameterValue -Names secret_key -WithDecryption $True).Parameters[0].Value']
+              
+              proc = 'process.exe'
+              path = f'c:/bin/{proc}'
+              commands.append(f'Start-Process -FilePath "{path}/{proc}" -workingdirectory "{path}" -RedirectStandardOutput {path}/debug.log')
+              
+              return boto3.client('ssm').send_command(
+                  InstanceIds  = ['i-0123456789'],
+                  DocumentName = 'AWS-RunPowerShellScript',
+                  Parameters   = {'commands': commands})
+      FunctionName: !Sub '${EnvironmentName}-rpc'
+      Handler: index.lambda_handler
+      Role: !GetAtt RPCRole.Arn
+      Runtime: python3.7
+      Timeout: 10
+      VpcConfig:
+        SecurityGroupIds: [!ImportValue LambdaSecurityGroup]
+        SubnetIds: [!ImportValue LambdaSubnet]
+  ParameterStoreLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+            import boto3
+            import cfnresponse
+            
+            def lambda_handler(event, context):
+              try:
+                parameters = [
+                  ('access_key',  event['ResourceProperties']['AccessKey']),
+                  ('secret_key',  event['ResourceProperties']['SecretKey']),
+                  ('region_name', event['ResourceProperties']['RegionName'])]
+                for name, value in parameters:
+                  if   event['RequestType'] == 'Create':
+                    boto3.client('ssm').put_parameter(Name=name, Value=value, Type='SecureString')
+                  elif event['RequestType'] == 'Delete':
+                    boto3.client('ssm').delete_parameter(Name=name)
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Data': 'Operation completed successfully'}, "None")
+              except Exception as e:
+                cfnresponse.send(event, context, cfnresponse.FAILED,  {'Data': str(e)}, "None")
+      FunctionName: !Sub '${EnvironmentName}-parameter-store'
+      Handler: index.lambda_handler
+      Role: !GetAtt ParameterStoreRole.Arn
+      Runtime: python3.7
+      Timeout: 30
+      VpcConfig:
+        SecurityGroupIds: [!ImportValue LambdaSecurityGroup]
+        SubnetIds: [!ImportValue LambdaSubnet]
+# Log Groups
+  RPCLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+      LogGroupName: !Sub '/aws/lambda/${RPCLambda}'
+  ParameterStoreLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+      LogGroupName: !Sub '/aws/lambda/${ParameterStoreLambda}'
+# Custom Resources
+  ParameterStore:
+    Type: Custom::ParameterStore
+    Properties:
+      ServiceToken: !GetAtt ParameterStoreLambda.Arn
+      AccessKey: !Ref SharedAccessKey
+      RegionName: !Ref SharedRegion
+      SecretKey: !Ref SharedSecretAccessKey
+# Servers
+  RPCServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      AvailabilityZone: !Select [1, !GetAZs {Ref: 'AWS::Region'}] # 1b
+      ImageId: !Ref WindowsAMI # Microsoft Windows Server 2019
+      InstanceType: t3.small
+      KeyName: !Ref AdminKey
+      SecurityGroupIds: [!ImportValue AdminSecurityGroup]
+      SubnetId: !ImportValue AdminSubnet
+      IamInstanceProfile: !Ref RPCServerInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 50
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-rpc-server'
